@@ -78,6 +78,54 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * Read baseline clipboard image state before snipping.
+     * Distinguishes 3 outcomes:
+     *   { status: 'has-image', blob: Blob, fingerprint: string }
+     *   { status: 'empty', blob: null, fingerprint: null }
+     *   { status: 'failed', error: Error | string }
+     */
+    async function getClipboardBaseline() {
+      if (!navigator.clipboard || typeof navigator.clipboard.read !== 'function') {
+        return { status: 'failed', error: new Error('navigator.clipboard.read API is not available') };
+      }
+      let items;
+      try {
+        items = await navigator.clipboard.read();
+      } catch (err) {
+        return { status: 'failed', error: err };
+      }
+
+      let imageBlob = null;
+      for (const item of items) {
+        for (const type of item.types) {
+          if (type.startsWith('image/')) {
+            try {
+              imageBlob = await item.getType(type);
+              break;
+            } catch (err) {
+              return { status: 'failed', error: err };
+            }
+          }
+        }
+        if (imageBlob) break;
+      }
+
+      if (!imageBlob) {
+        return { status: 'empty', blob: null, fingerprint: null };
+      }
+
+      try {
+        const fingerprint = await computeBlobFingerprint(imageBlob);
+        if (!fingerprint) {
+          return { status: 'failed', error: new Error('Failed to compute image fingerprint') };
+        }
+        return { status: 'has-image', blob: imageBlob, fingerprint };
+      } catch (err) {
+        return { status: 'failed', error: err };
+      }
+    }
+
     function ScreenshotToolbarControl() {
       const [status, setStatus] = React.useState('idle'); // 'idle' | 'capturing' | 'success'
       const [hoverScreenshot, setHoverScreenshot] = React.useState(false);
@@ -119,13 +167,18 @@ window.__ModuleLoader__.load({
           activeCycleRef.current = null;
         }
 
-        setStatus('capturing');
-
         // 1. Calculate baseline image fingerprint (bytes + SHA-256) before snipping
-        const baselineBlob = await readImageBlobFromClipboard();
-        const baselineFingerprint = await computeBlobFingerprint(baselineBlob);
+        const baseline = await getClipboardBaseline();
+        if (baseline.status === 'failed') {
+          console.warn('[ScreenshotButton] Clipboard baseline read or fingerprint calculation failed, aborting capture:', baseline.error);
+          setStatus('idle');
+          return;
+        }
 
         if (isUnmountedRef.current) return;
+        setStatus('capturing');
+
+        const baselineFingerprint = baseline.fingerprint;
 
         // 2. Trigger Windows native screen snipping via Host endpoint
         try {

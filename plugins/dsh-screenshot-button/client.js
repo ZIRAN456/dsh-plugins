@@ -130,9 +130,9 @@ window.__ModuleLoader__.load({
       const [status, setStatus] = React.useState('idle'); // 'idle' | 'capturing' | 'success'
       const [hoverScreenshot, setHoverScreenshot] = React.useState(false);
       const [hoverPaste, setHoverPaste] = React.useState(false);
+      const isCapturingRef = React.useRef(false);
       const activeCycleRef = React.useRef(null);
       const isUnmountedRef = React.useRef(false);
-      const lastInsertedFingerprintRef = React.useRef(null);
       const isZh = typeof navigator !== 'undefined' && (navigator.language || '').toLowerCase().startsWith('zh');
       const isWin = typeof navigator !== 'undefined' && /windows|win32/i.test(navigator.userAgent || navigator.platform || '');
 
@@ -144,10 +144,12 @@ window.__ModuleLoader__.load({
             activeCycleRef.current.abort();
             activeCycleRef.current = null;
           }
+          isCapturingRef.current = false;
         };
       }, []);
 
       const handlePasteDirect = async () => {
+        if (isCapturingRef.current) return;
         setStatus('capturing');
         const blob = await readImageBlobFromClipboard();
         if (blob) {
@@ -161,22 +163,53 @@ window.__ModuleLoader__.load({
       };
 
       const handleScreenshot = async () => {
-        // Cancel any active capture cycle before starting a new one
-        if (activeCycleRef.current) {
-          activeCycleRef.current.abort();
-          activeCycleRef.current = null;
-        }
+        // Synchronous lock immediately on click: prevent click gap and multiple concurrent backend calls
+        if (isCapturingRef.current || isUnmountedRef.current) return;
+        isCapturingRef.current = true;
+        setStatus('capturing');
+
+        let handled = false;
+        let pollTimer = null;
+        let expireTimer = null;
+        let onFocus = null;
+
+        const cleanup = () => {
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          if (expireTimer) { clearTimeout(expireTimer); expireTimer = null; }
+          if (onFocus) {
+            window.removeEventListener('focus', onFocus);
+            onFocus = null;
+          }
+          if (activeCycleRef.current === cycle) {
+            activeCycleRef.current = null;
+          }
+          isCapturingRef.current = false;
+        };
+
+        const cycle = {
+          aborted: false,
+          abort: () => {
+            cycle.aborted = true;
+            handled = true;
+            cleanup();
+            if (!isUnmountedRef.current) setStatus('idle');
+          },
+        };
+        activeCycleRef.current = cycle;
 
         // 1. Calculate baseline image fingerprint (bytes + SHA-256) before snipping
         const baseline = await getClipboardBaseline();
-        if (baseline.status === 'failed') {
-          console.warn('[ScreenshotButton] Clipboard baseline read or fingerprint calculation failed, aborting capture:', baseline.error);
-          setStatus('idle');
+        if (cycle.aborted || isUnmountedRef.current) {
+          cleanup();
           return;
         }
 
-        if (isUnmountedRef.current) return;
-        setStatus('capturing');
+        if (baseline.status === 'failed') {
+          console.warn('[ScreenshotButton] Clipboard baseline read or fingerprint calculation failed, aborting capture:', baseline.error);
+          cleanup();
+          if (!isUnmountedRef.current) setStatus('idle');
+          return;
+        }
 
         const baselineFingerprint = baseline.fingerprint;
 
@@ -186,55 +219,40 @@ window.__ModuleLoader__.load({
             method: 'POST',
             credentials: 'include',
           });
+          if (cycle.aborted || isUnmountedRef.current) {
+            cleanup();
+            return;
+          }
           if (!resp.ok) {
             console.warn('[ScreenshotButton] trigger snipping rejected with status:', resp.status);
+            cleanup();
             if (!isUnmountedRef.current) setStatus('idle');
             return;
           }
         } catch (err) {
           console.warn('[ScreenshotButton] trigger snipping error:', err);
+          cleanup();
           if (!isUnmountedRef.current) setStatus('idle');
           return;
         }
 
-        if (isUnmountedRef.current) return;
+        if (cycle.aborted || isUnmountedRef.current) {
+          cleanup();
+          return;
+        }
 
         // 3. Continuously poll every 500ms and check immediately on window focus, up to 12s
-        let handled = false;
         let inFlight = false;
-        let pollTimer = null;
-        let expireTimer = null;
-
-        const cleanup = () => {
-          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-          if (expireTimer) { clearTimeout(expireTimer); expireTimer = null; }
-          window.removeEventListener('focus', onFocus);
-          if (activeCycleRef.current === cycle) {
-            activeCycleRef.current = null;
-          }
-        };
-
-        const cycle = {
-          abort: () => {
-            handled = true;
-            cleanup();
-          },
-        };
-        activeCycleRef.current = cycle;
 
         const checkClipboard = async () => {
-          if (handled || inFlight || isUnmountedRef.current) return;
+          if (handled || inFlight || cycle.aborted || isUnmountedRef.current) return;
           inFlight = true;
           try {
             const currentBlob = await readImageBlobFromClipboard();
-            if (!currentBlob || handled || isUnmountedRef.current) return;
+            if (!currentBlob || handled || cycle.aborted || isUnmountedRef.current) return;
             const currentFingerprint = await computeBlobFingerprint(currentBlob);
-            if (currentFingerprint && currentFingerprint !== baselineFingerprint && !handled && !isUnmountedRef.current) {
-              if (lastInsertedFingerprintRef.current === currentFingerprint) {
-                return;
-              }
+            if (currentFingerprint && currentFingerprint !== baselineFingerprint && !handled && !cycle.aborted && !isUnmountedRef.current) {
               handled = true;
-              lastInsertedFingerprintRef.current = currentFingerprint;
               cleanup();
               const file = new File([currentBlob], `screenshot-${Date.now()}.png`, { type: currentBlob.type || 'image/png' });
               insertImageFile(file);
@@ -250,7 +268,7 @@ window.__ModuleLoader__.load({
           }
         };
 
-        const onFocus = () => {
+        onFocus = () => {
           checkClipboard();
           setTimeout(checkClipboard, 350);
         };
@@ -349,15 +367,16 @@ window.__ModuleLoader__.load({
 
       const controls = [];
       if (isWin) {
+        const isBusy = status === 'capturing' || isCapturingRef.current;
         controls.push(
           h('button', {
             key: 'main-btn',
             type: 'button',
-            disabled: status === 'capturing',
+            disabled: isBusy,
             style: {
               ...screenshotBtnStyle,
-              cursor: status === 'capturing' ? 'default' : 'pointer',
-              opacity: status === 'capturing' ? 0.85 : 1,
+              cursor: isBusy ? 'default' : 'pointer',
+              opacity: isBusy ? 0.85 : 1,
             },
             title: isZh ? '唤起系统截图 (Win+Shift+S)，框选后切回自动插入' : 'Trigger Windows Snip (Win+Shift+S) and auto-insert',
             onClick: handleScreenshot,

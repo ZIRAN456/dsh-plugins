@@ -79,6 +79,66 @@ function createTrackedTimers() {
   };
 }
 
+/** 把已经排队的异步回调跑完（剪贴板读取、哈希计算等）。 */
+async function flushAsync(rounds = 8) {
+  for (let i = 0; i < rounds; i++) {
+    await new Promise((r) => setImmediate(r));
+  }
+}
+
+/**
+ * 假时钟：只给沙箱里的插件代码用，可以瞬间“快进”到某个时刻，
+ * 用来真正检查 12 秒超时，而不用让测试真的等 12 秒。
+ */
+function createFakeClock() {
+  let now = 0;
+  let seq = 0;
+  const timers = new Map();
+  return {
+    setTimeout(fn, ms = 0, ...args) {
+      const id = ++seq;
+      timers.set(id, { at: now + Math.max(0, ms), fn, args, every: null });
+      return id;
+    },
+    clearTimeout(id) {
+      timers.delete(id);
+    },
+    setInterval(fn, ms = 0, ...args) {
+      const id = ++seq;
+      timers.set(id, { at: now + Math.max(1, ms), fn, args, every: Math.max(1, ms) });
+      return id;
+    },
+    clearInterval(id) {
+      timers.delete(id);
+    },
+    liveCount(kind) {
+      return Array.from(timers.values()).filter((t) => !kind || (kind === 'interval') === (t.every !== null)).length;
+    },
+    now: () => now,
+    async advance(ms) {
+      const target = now + ms;
+      for (;;) {
+        let nextId = null;
+        let next = null;
+        for (const [id, t] of timers) {
+          if (t.at <= target && (!next || t.at < next.at)) {
+            next = t;
+            nextId = id;
+          }
+        }
+        if (!next) break;
+        now = next.at;
+        if (next.every !== null) next.at += next.every;
+        else timers.delete(nextId);
+        next.fn(...next.args);
+        await flushAsync();
+      }
+      now = target;
+      await flushAsync();
+    },
+  };
+}
+
 afterEach(() => {
   for (const rec of allSandboxTimers) {
     if (rec.kind === 'interval') globalThis.clearInterval(rec.handle);
@@ -301,7 +361,7 @@ const setupRealClient = setupRealScreenshotClient;
 // TEST CATEGORY 1: 真实 client.js 剪贴板逻辑测试 (5 类情况)
 // ---------------------------------------------------------------------
 
-test('1.1 [真实 client.js] 剪贴板有旧图，点截图后取消 -> 旧图绝不插入，超时满12秒恢复 idle 且无任何插入', async () => {
+test('1.1 [真实 client.js] 剪贴板有旧图，点截图后取消 -> 旧图绝不插入，等待期间按钮禁用 (12 秒超时恢复由 1.6 检查)', async () => {
   const oldImageBlob = createMockImageBlob('OLD_STALE_IMAGE_BYTES_111');
   let currentClipboardBlob = oldImageBlob;
 
@@ -312,8 +372,7 @@ test('1.1 [真实 client.js] 剪贴板有旧图，点截图后取消 -> 旧图�
     }],
   };
 
-  // Mock setTimeout to advance fast-forwarding 12s
-  let activeTimers = [];
+  // 只检查“取消后不插旧图、等待中按钮禁用”；满 12 秒超时后的恢复见测试 1.6
   const client = setupRealClient({ clipboard });
   const tree1 = client.render();
   const mainBtn = tree1.children.find((c) => c.props.key === 'main-btn');
@@ -465,6 +524,41 @@ test('1.5 [真实 client.js] 后端拒绝请求 (501/500/网络失败) -> 前端
   assert.equal(client501.dispatchedEvents.length, 0, '没有插入任何图片');
 
   client501.unmount();
+});
+
+test('1.6 [真实 client.js] 点截图后一直没有新图 -> 满 12 秒才超时：11.9 秒时仍在等待，12 秒后按钮恢复可点、不插图、定时器和监听清干净，并能再截一次', async () => {
+  const clock = createFakeClock();
+  const oldImageBlob = createMockImageBlob('OLD_IMAGE_TIMEOUT_CASE');
+  const clipboard = {
+    read: async () => [{
+      types: ['image/png'],
+      getType: async () => oldImageBlob,
+    }],
+  };
+
+  const client = setupRealClient({ clipboard, timers: clock });
+  const mainBtn = () => client.render().children.find((c) => c.props.key === 'main-btn');
+
+  await mainBtn().props.onClick();
+  assert.equal(client.recordedFetchCalls.length, 1, '第一次点击唤起截图后端');
+  assert.equal(mainBtn().props.disabled, true, '等待框选期间按钮禁用');
+
+  await clock.advance(11_900);
+  assert.equal(mainBtn().props.disabled, true, '不满 12 秒时仍在等待，按钮保持禁用');
+  assert.equal(client.dispatchedEvents.length, 0, '等待期间旧图不插入');
+
+  await clock.advance(200);
+  const btnAfter = mainBtn();
+  assert.equal(btnAfter.props.disabled, false, '满 12 秒超时后按钮恢复可点');
+  assert.equal(btnAfter.children.find((c) => c.props.key === 'txt').children[0], '截图', '超时后按钮文字恢复为「截图」');
+  assert.equal(client.dispatchedEvents.length, 0, '超时后没有插入任何图片');
+  assert.equal(client.liveIntervals(), 0, '超时后轮询定时器已清掉');
+  assert.equal(client.focusListeners.size, 0, '超时后焦点监听已移除');
+
+  await mainBtn().props.onClick();
+  assert.equal(client.recordedFetchCalls.length, 2, '超时恢复后能再截一次');
+
+  client.unmount();
 });
 
 // ---------------------------------------------------------------------
@@ -720,9 +814,11 @@ test('3.2 [真实 index.js] 后端接口：Windows 上启动失败 (如无法启
     Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
     process.env.PATH = join(tmpdir(), 'empty_path_for_test_' + Date.now());
 
-    // Should return 500 or handle error event without uncaughtException
+    // 启动失败只能返回 500（不接受 200），且宿主不崩溃
     const resp = await registeredRoute.fetch(new Request('http://127.0.0.1/api/local/trigger-snipping', { method: 'POST' }));
-    assert.ok(resp.status === 500 || resp.status === 200);
+    assert.equal(resp.status, 500, '启动截图工具失败时必须返回 500');
+    const body = await resp.json();
+    assert.equal(body.ok, false, '启动失败时返回内容不能说成功');
   } finally {
     Object.defineProperty(process, 'platform', { value: origPlatform, configurable: true });
     process.env.PATH = origPath;

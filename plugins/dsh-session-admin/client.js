@@ -15,6 +15,9 @@ window.__ModuleLoader__.load({
     /** Route the browser posts a storage-inventory request to. */
     const INVENTORY_ROUTE = 'api/sessionAdmin/inventory';
 
+    /** Route the browser probes storage compatibility with. */
+    const STATUS_ROUTE = 'api/sessionAdmin/status';
+
     /** Main-panel key of the cleanup page, also its sidebar launcher id. */
     const PANEL_ID = 'session-admin-cleanup';
 
@@ -759,6 +762,20 @@ window.__ModuleLoader__.load({
         const requests = createStore(null);
         const notice = createStore(null);
         const t = ctx.locale.bind(NS);
+
+        // Proactively probe storage compatibility on startup to reflect in menu immediately
+        fetch(new URL(STATUS_ROUTE, document.baseURI).href, {
+          method: 'GET',
+          credentials: 'include',
+        })
+          .then((res) => res.json())
+          .then((data) => {
+            if (data?.ok !== true || data?.error?.code === 'session-admin/storage-incompatible') {
+              supportStore.set(false);
+            }
+          })
+          .catch(() => {});
+
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'session-admin: dictionaries');
         ctx.effect(() => {
           const tag = document.createElement('style');

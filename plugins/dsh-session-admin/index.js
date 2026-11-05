@@ -12,7 +12,7 @@
  *   3. the JSONL session directory (log generations plus the write lock),
  *   4. the client Session list, told to drop the row.
  *
- * Steps 1鈥? run through public service methods only, so the registry's own
+ * Steps 1-3 run through public service methods only, so the registry's own
  * cache can never be clobbered by a stale copy. A running Agent refuses the
  * whole operation: its write handle keeps the kernel lock and would leave a
  * half-deleted Session behind.

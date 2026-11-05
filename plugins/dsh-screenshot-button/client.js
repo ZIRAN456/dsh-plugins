@@ -66,6 +66,7 @@ window.__ModuleLoader__.load({
       const [hoverScreenshot, setHoverScreenshot] = React.useState(false);
       const [hoverPaste, setHoverPaste] = React.useState(false);
       const isZh = typeof navigator !== 'undefined' && (navigator.language || '').toLowerCase().startsWith('zh');
+      const isWin = typeof navigator !== 'undefined' && /windows|win32/i.test(navigator.userAgent || navigator.platform || '');
 
       const handlePasteDirect = async () => {
         setStatus('capturing');
@@ -82,40 +83,52 @@ window.__ModuleLoader__.load({
       const handleScreenshot = async () => {
         setStatus('capturing');
 
-        // 1. Trigger Windows native screen snipping via Host HTTP endpoint
+        // 1. Record baseline clipboard image size to prevent pasting stale image if user cancels
+        const baseline = await readImageFromClipboard();
+        const baselineFingerprint = baseline ? `${baseline.size}_${baseline.lastModified}` : 'empty';
+
+        // 2. Trigger Windows native screen snipping via Host endpoint
         try {
-          await fetch('/api/local/trigger-snipping', { method: 'POST' });
+          const resp = await fetch('/api/local/trigger-snipping', { method: 'POST' });
+          if (!resp.ok) {
+            console.warn('[ScreenshotButton] trigger snipping responded with status:', resp.status);
+          }
         } catch (err) {
           console.warn('[ScreenshotButton] trigger snipping error:', err);
         }
 
-        // 2. Listen for window focus when user finishes snipping and clicks back
-        let done = false;
-        const checkAndInsert = async () => {
-          if (done) return;
-          const file = await readImageFromClipboard();
-          if (file) {
-            done = true;
-            insertImageFile(file);
-            setStatus('success');
-            setTimeout(() => setStatus('idle'), 1600);
-          }
-        };
-
+        // 3. Listen for window focus: only check clipboard when focus returns after snip
+        let handled = false;
         const onFocus = () => {
           window.removeEventListener('focus', onFocus);
-          setTimeout(checkAndInsert, 300);
+          setTimeout(async () => {
+            if (handled) return;
+            const latest = await readImageFromClipboard();
+            if (!latest) {
+              setStatus('idle');
+              return;
+            }
+            const latestFingerprint = `${latest.size}_${latest.lastModified}`;
+            // Only insert if clipboard has a newly captured image
+            if (baselineFingerprint === 'empty' || latestFingerprint !== baselineFingerprint) {
+              handled = true;
+              insertImageFile(latest);
+              setStatus('success');
+              setTimeout(() => setStatus('idle'), 1600);
+            } else {
+              // User canceled or clipboard didn't update: do not paste old image
+              setStatus('idle');
+            }
+          }, 350);
         };
 
         window.addEventListener('focus', onFocus);
 
-        // Fallback polling check after 1.5s, 3s, 5s in case focus already occurred
-        setTimeout(checkAndInsert, 1500);
-        setTimeout(checkAndInsert, 3500);
+        // Safety timeout to clean up listener if user stays away
         setTimeout(() => {
           window.removeEventListener('focus', onFocus);
           setStatus((prev) => (prev === 'capturing' ? 'idle' : prev));
-        }, 12000);
+        }, 30000);
       };
 
       const containerStyle = {
@@ -198,6 +211,10 @@ window.__ModuleLoader__.load({
       if (status === 'capturing') textLabel = isZh ? '等待框选...' : 'Snipping...';
       if (status === 'success') textLabel = isZh ? '✓ 已插入' : '✓ Inserted';
 
+      const screenshotTooltip = isWin
+        ? (isZh ? '唤起系统截图 (Win+Shift+S)，框选后切回自动插入' : 'Trigger Windows Snip (Win+Shift+S) and auto-insert')
+        : (isZh ? '系统截图仅支持 Windows；可在外部截图后点击【贴图】' : 'Native snip is Windows-only; use Paste after screenshotting');
+
       return h('div', {
         style: containerStyle,
       }, [
@@ -206,7 +223,7 @@ window.__ModuleLoader__.load({
           key: 'main-btn',
           type: 'button',
           style: screenshotBtnStyle,
-          title: isZh ? '唤起系统截图 (Win+Shift+S)，框选后切回自动插入' : 'Trigger Windows Snip (Win+Shift+S) and auto-insert',
+          title: screenshotTooltip,
           onClick: handleScreenshot,
           onMouseEnter: () => setHoverScreenshot(true),
           onMouseLeave: () => setHoverScreenshot(false),

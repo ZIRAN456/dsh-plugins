@@ -1,0 +1,10 @@
+{
+  "name": "dsh-plugins",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Curated plugins for DeepSeek Harness (DSH)",
+  "scripts": {
+    "test": "node test/plugins.test.mjs"
+  },
+  "license": "MIT"
+}

@@ -124,6 +124,7 @@ window.__ModuleLoader__.load({
 
         // 3. Continuously poll every 500ms and check immediately on window focus, up to 12s
         let handled = false;
+        let inFlight = false;
         let pollTimer = null;
         let expireTimer = null;
 
@@ -134,17 +135,22 @@ window.__ModuleLoader__.load({
         };
 
         const checkClipboard = async () => {
-          if (handled) return;
-          const currentBlob = await readImageBlobFromClipboard();
-          if (!currentBlob) return;
-          const currentFingerprint = await computeBlobFingerprint(currentBlob);
-          if (currentFingerprint && currentFingerprint !== baselineFingerprint) {
-            handled = true;
-            cleanup();
-            const file = new File([currentBlob], `screenshot-${Date.now()}.png`, { type: currentBlob.type || 'image/png' });
-            insertImageFile(file);
-            setStatus('success');
-            setTimeout(() => setStatus('idle'), 1600);
+          if (handled || inFlight) return;
+          inFlight = true;
+          try {
+            const currentBlob = await readImageBlobFromClipboard();
+            if (!currentBlob || handled) return;
+            const currentFingerprint = await computeBlobFingerprint(currentBlob);
+            if (currentFingerprint && currentFingerprint !== baselineFingerprint && !handled) {
+              handled = true;
+              cleanup();
+              const file = new File([currentBlob], `screenshot-${Date.now()}.png`, { type: currentBlob.type || 'image/png' });
+              insertImageFile(file);
+              setStatus('success');
+              setTimeout(() => setStatus('idle'), 1600);
+            }
+          } finally {
+            inFlight = false;
           }
         };
 

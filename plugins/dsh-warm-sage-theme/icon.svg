@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Warm Sage Theme">
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="#FAF6EF"/>
+  <path d="M32 47c0-9 5.5-16 14-17.5C46 40 40.5 46.5 32 47z" fill="#5F7F5A"/>
+  <path d="M32 47c0-8-4.8-14.2-12.2-15.5C19.8 41 25 46.6 32 47z" fill="#8DAF85"/>
+  <circle cx="32" cy="20" r="4" fill="#B07C2C"/>
+</svg>

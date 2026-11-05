@@ -1,0 +1,13 @@
+{
+  "meta": {
+    "title": "Composer Screenshot Button",
+    "description": "Adds a button below the composer to trigger Windows screen snip and insert captured images"
+  },
+  "button": {
+    "label": "Screenshot",
+    "tooltip": "Trigger Windows Snip (Win+Shift+S) and auto-import",
+    "capturing": "Capturing...",
+    "importClipboard": "Import from Clipboard",
+    "success": "Imported"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "meta": {
+    "title": "输入框截图按钮",
+    "description": "在对话框下方提供一键唤起 Windows 原生截图并自动导入图片附件的功能"
+  },
+  "button": {
+    "label": "截图",
+    "tooltip": "点击唤起系统截图 (Win+Shift+S)，截取后自动导入",
+    "capturing": "等待截图...",
+    "importClipboard": "贴入剪贴板图片",
+    "success": "已导入"
+  }
+}

@@ -42,16 +42,15 @@ window.__ModuleLoader__.load({
       return false;
     }
 
-    // Helper: read image from clipboard
-    async function readImageFromClipboard() {
+    // Helper: read image blob from clipboard
+    async function readImageBlobFromClipboard() {
       if (!navigator.clipboard || !navigator.clipboard.read) return null;
       try {
         const items = await navigator.clipboard.read();
         for (const item of items) {
           for (const type of item.types) {
             if (type.startsWith('image/')) {
-              const blob = await item.getType(type);
-              return new File([blob], `screenshot-${Date.now()}.png`, { type: blob.type || 'image/png' });
+              return await item.getType(type);
             }
           }
         }
@@ -59,6 +58,21 @@ window.__ModuleLoader__.load({
         console.warn('[ScreenshotButton] clipboard read warning:', err);
       }
       return null;
+    }
+
+    // Helper: compute SHA-256 content fingerprint for an image blob
+    async function computeBlobFingerprint(blob) {
+      if (!blob) return null;
+      try {
+        const buffer = await blob.arrayBuffer();
+        const digest = await crypto.subtle.digest('SHA-256', buffer);
+        const hashArray = Array.from(new Uint8Array(digest));
+        const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        return `${blob.size}:${hashHex}`;
+      } catch (err) {
+        console.warn('[ScreenshotButton] Failed to compute image fingerprint:', err);
+        return null;
+      }
     }
 
     function ScreenshotToolbarControl() {
@@ -70,8 +84,9 @@ window.__ModuleLoader__.load({
 
       const handlePasteDirect = async () => {
         setStatus('capturing');
-        const file = await readImageFromClipboard();
-        if (file) {
+        const blob = await readImageBlobFromClipboard();
+        if (blob) {
+          const file = new File([blob], `screenshot-${Date.now()}.png`, { type: blob.type || 'image/png' });
           insertImageFile(file);
           setStatus('success');
           setTimeout(() => setStatus('idle'), 1600);
@@ -83,9 +98,9 @@ window.__ModuleLoader__.load({
       const handleScreenshot = async () => {
         setStatus('capturing');
 
-        // 1. Record baseline clipboard image size to prevent pasting stale image if user cancels
-        const baseline = await readImageFromClipboard();
-        const baselineFingerprint = baseline ? `${baseline.size}_${baseline.lastModified}` : 'empty';
+        // 1. Calculate baseline image fingerprint (bytes + SHA-256) before snipping
+        const baselineBlob = await readImageBlobFromClipboard();
+        const baselineFingerprint = await computeBlobFingerprint(baselineBlob);
 
         // 2. Trigger Windows native screen snipping via Host endpoint
         try {
@@ -97,38 +112,47 @@ window.__ModuleLoader__.load({
           console.warn('[ScreenshotButton] trigger snipping error:', err);
         }
 
-        // 3. Listen for window focus: only check clipboard when focus returns after snip
+        // 3. Continuously poll every 500ms and check immediately on window focus, up to 12s
         let handled = false;
-        const onFocus = () => {
+        let pollTimer = null;
+        let expireTimer = null;
+
+        const cleanup = () => {
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          if (expireTimer) { clearTimeout(expireTimer); expireTimer = null; }
           window.removeEventListener('focus', onFocus);
-          setTimeout(async () => {
-            if (handled) return;
-            const latest = await readImageFromClipboard();
-            if (!latest) {
-              setStatus('idle');
-              return;
-            }
-            const latestFingerprint = `${latest.size}_${latest.lastModified}`;
-            // Only insert if clipboard has a newly captured image
-            if (baselineFingerprint === 'empty' || latestFingerprint !== baselineFingerprint) {
-              handled = true;
-              insertImageFile(latest);
-              setStatus('success');
-              setTimeout(() => setStatus('idle'), 1600);
-            } else {
-              // User canceled or clipboard didn't update: do not paste old image
-              setStatus('idle');
-            }
-          }, 350);
+        };
+
+        const checkClipboard = async () => {
+          if (handled) return;
+          const currentBlob = await readImageBlobFromClipboard();
+          if (!currentBlob) return;
+          const currentFingerprint = await computeBlobFingerprint(currentBlob);
+          if (currentFingerprint && currentFingerprint !== baselineFingerprint) {
+            handled = true;
+            cleanup();
+            const file = new File([currentBlob], `screenshot-${Date.now()}.png`, { type: currentBlob.type || 'image/png' });
+            insertImageFile(file);
+            setStatus('success');
+            setTimeout(() => setStatus('idle'), 1600);
+          }
+        };
+
+        const onFocus = () => {
+          checkClipboard();
+          setTimeout(checkClipboard, 350);
         };
 
         window.addEventListener('focus', onFocus);
+        pollTimer = setInterval(checkClipboard, 500);
 
-        // Safety timeout to clean up listener if user stays away
-        setTimeout(() => {
-          window.removeEventListener('focus', onFocus);
-          setStatus((prev) => (prev === 'capturing' ? 'idle' : prev));
-        }, 30000);
+        // Expire after 12 seconds: restore button and do not insert anything
+        expireTimer = setTimeout(() => {
+          if (!handled) {
+            cleanup();
+            setStatus('idle');
+          }
+        }, 12000);
       };
 
       const containerStyle = {

@@ -35,7 +35,7 @@
 解决官方默认只能“归档会话”无法彻底清理的痛点：
 * **侧边栏一键删除**：在左侧会话历史的右键 / `...` 菜单中增加“彻底删除”选项；
 * **深度物理清理**：同步清理会话登记信息 (Session Registry)、投影缓存、JSONL 磁盘会话日志与文件碎片；
-* **存储布局启动与前置双重校验**：启动期与执行前严格校验 DSH 根目录、`sessions` 目录及 `session_projcache/sessions` 目录完整性，结构异常时日志警告并返回 `session-admin/storage-incompatible`，前端删除按钮显示“当前 Harness 版本不支持”；
+* **存储布局启动与前置双重校验**：启动期与执行前严格校验 DSH 根目录、`sessions` 目录及 `session_projcache/sessions` 目录完整性，结构异常时日志警告并返回 `session-admin/storage-incompatible`，前端侧边栏菜单初始化即探测并显示为“当前 Harness 版本不支持”（若后续手动修复目录结构，需刷新页面恢复）；
 * **内核安全保护**：具备二次确认框提示，自动识别活跃运行中会话并拒绝删除，会话 ID 严格做注入转码与安全路径校验，避免内核死锁与路径穿越。
 
 ### 3. 🌿 温润鼠尾草绿主题 (`dsh-warm-sage-theme`)

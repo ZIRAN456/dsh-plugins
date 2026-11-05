@@ -1,4 +1,4 @@
-import test from 'node:test';
+import nodeTest, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -9,6 +9,83 @@ import { EventEmitter } from 'node:events';
 // Real backend imports from the actual repository code
 import * as screenshotBackend from '../plugins/dsh-screenshot-button/index.js';
 import * as sessionAdminBackend from '../plugins/dsh-session-admin/index.js';
+
+// ---------------------------------------------------------------------
+// 时间上限：每条测试最多 20 秒，超时算失败；整套测试最多 120 秒，超过就以失败退出。
+// ---------------------------------------------------------------------
+const PER_TEST_TIMEOUT_MS = 20_000;
+const SUITE_TIMEOUT_MS = 120_000;
+
+function test(name, fn) {
+  return nodeTest(name, { timeout: PER_TEST_TIMEOUT_MS }, fn);
+}
+
+// unref：测试正常结束时不拖住进程；只有别的东西让进程挂住时才会触发。
+setTimeout(() => {
+  console.error(`✖ 整套测试超过 ${SUITE_TIMEOUT_MS / 1000} 秒仍未结束，按失败处理并强制退出`);
+  process.exit(1);
+}, SUITE_TIMEOUT_MS).unref();
+
+/**
+ * 记录插件代码在沙箱里开的所有定时器。
+ * 每条测试结束后把还活着的定时器全部清掉，这样插件漏清定时器时，
+ * 测试只会在断言上失败，不会让整套测试一直挂着跑不完。
+ */
+const allSandboxTimers = new Set();
+
+function createTrackedTimers() {
+  const live = new Set();
+  const track = (kind, handle) => {
+    const rec = { kind, handle };
+    live.add(rec);
+    allSandboxTimers.add(rec);
+    return rec;
+  };
+  const untrack = (handle) => {
+    for (const rec of live) {
+      if (rec.handle === handle) {
+        live.delete(rec);
+        allSandboxTimers.delete(rec);
+      }
+    }
+  };
+  return {
+    setTimeout(fn, ms, ...args) {
+      let rec = null;
+      const handle = globalThis.setTimeout(() => {
+        live.delete(rec);
+        allSandboxTimers.delete(rec);
+        fn(...args);
+      }, ms);
+      rec = track('timeout', handle);
+      return handle;
+    },
+    clearTimeout(handle) {
+      untrack(handle);
+      globalThis.clearTimeout(handle);
+    },
+    setInterval(fn, ms, ...args) {
+      const handle = globalThis.setInterval(fn, ms, ...args);
+      track('interval', handle);
+      return handle;
+    },
+    clearInterval(handle) {
+      untrack(handle);
+      globalThis.clearInterval(handle);
+    },
+    liveCount(kind) {
+      return Array.from(live).filter((r) => !kind || r.kind === kind).length;
+    },
+  };
+}
+
+afterEach(() => {
+  for (const rec of allSandboxTimers) {
+    if (rec.kind === 'interval') globalThis.clearInterval(rec.handle);
+    else globalThis.clearTimeout(rec.handle);
+  }
+  allSandboxTimers.clear();
+});
 
 const screenshotClientSource = readFileSync(new URL('../plugins/dsh-screenshot-button/client.js', import.meta.url), 'utf8');
 const sessionAdminClientSource = readFileSync(new URL('../plugins/dsh-session-admin/client.js', import.meta.url), 'utf8');
@@ -31,8 +108,9 @@ function createMockImageBlob(contentStr, type = 'image/png') {
 /**
  * Test Harness to execute real screenshot client.js code through node:vm
  */
-function setupRealScreenshotClient({ clipboard, fetchFn, userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', platform = 'Win32' } = {}) {
+function setupRealScreenshotClient({ clipboard, fetchFn, userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', platform = 'Win32', timers } = {}) {
   let capturedFactory = null;
+  const sandboxTimers = timers || createTrackedTimers();
   const focusListeners = new Set();
   const dispatchedEvents = [];
   const recordedFetchCalls = [];
@@ -92,10 +170,10 @@ function setupRealScreenshotClient({ clipboard, fetchFn, userAgent = 'Mozilla/5.
     fetch: activeFetch,
     URL: globalThis.URL,
     console,
-    setTimeout: globalThis.setTimeout,
-    clearTimeout: globalThis.clearTimeout,
-    setInterval: globalThis.setInterval,
-    clearInterval: globalThis.clearInterval,
+    setTimeout: sandboxTimers.setTimeout,
+    clearTimeout: sandboxTimers.clearTimeout,
+    setInterval: sandboxTimers.setInterval,
+    clearInterval: sandboxTimers.clearInterval,
     DataTransfer: class {
       constructor() {
         this.items = { add: (file) => { this.file = file; } };
@@ -212,6 +290,8 @@ function setupRealScreenshotClient({ clipboard, fetchFn, userAgent = 'Mozilla/5.
     dispatchedEvents,
     focusListeners,
     recordedFetchCalls,
+    liveIntervals: () => sandboxTimers.liveCount('interval'),
+    liveTimers: () => sandboxTimers.liveCount(),
   };
 }
 

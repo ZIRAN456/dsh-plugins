@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import vm from 'node:vm';
 import { EventEmitter } from 'node:events';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 
 // Real backend imports from the actual repository code
 import * as screenshotBackend from '../plugins/dsh-screenshot-button/index.js';
@@ -757,6 +758,97 @@ test('2.6 [真实 client.js] 请求地址与认证凭据 -> 请求携带 credent
 // TEST CATEGORY 3: 真实后端 index.js 接口测试
 // ---------------------------------------------------------------------
 
+test('2.7 [真实 client.js] 点击前读基准时「取图片数据」失败 (getType 报错) -> 当作读取失败而不是「剪贴板没图」：不唤起截图后端、不插图、按钮恢复', async () => {
+  const clipboard = {
+    read: async () => [{
+      types: ['image/png'],
+      getType: async () => {
+        throw new Error('NotAllowedError: image data unavailable');
+      },
+    }],
+  };
+
+  const client = setupRealClient({ clipboard });
+  const mainBtn = () => client.render().children.find((c) => c.props.key === 'main-btn');
+
+  await mainBtn().props.onClick();
+
+  assert.equal(client.recordedFetchCalls.length, 0, '取图片数据失败时不能唤起截图后端');
+  assert.equal(client.dispatchedEvents.length, 0, '没有插入任何图片');
+  assert.equal(mainBtn().props.disabled, false, '按钮恢复可点');
+  assert.equal(client.liveIntervals(), 0, '没有留下轮询定时器');
+  assert.equal(client.focusListeners.size, 0, '没有留下焦点监听');
+
+  client.unmount();
+});
+
+test('2.8 [真实 client.js] 点击前读基准时「计算指纹」失败 (图片字节读不出) -> 当作读取失败而不是「剪贴板没图」：不唤起截图后端、不插图、按钮恢复', async () => {
+  const brokenBlob = {
+    size: 42,
+    type: 'image/png',
+    async arrayBuffer() {
+      throw new Error('NotReadableError: blob bytes unavailable');
+    },
+  };
+  const clipboard = {
+    read: async () => [{
+      types: ['image/png'],
+      getType: async () => brokenBlob,
+    }],
+  };
+
+  const client = setupRealClient({ clipboard });
+  const mainBtn = () => client.render().children.find((c) => c.props.key === 'main-btn');
+
+  await mainBtn().props.onClick();
+
+  assert.equal(client.recordedFetchCalls.length, 0, '指纹算不出来时不能唤起截图后端');
+  assert.equal(client.dispatchedEvents.length, 0, '没有插入任何图片');
+  assert.equal(mainBtn().props.disabled, false, '按钮恢复可点');
+  assert.equal(client.liveIntervals(), 0, '没有留下轮询定时器');
+
+  client.unmount();
+});
+
+test('2.9 [真实 client.js] 插入新图后本轮必须结束 -> 同一轮里剪贴板再变、窗口再获得焦点、轮询再跑都不再插第二张', async () => {
+  const oldImageBlob = createMockImageBlob('OLD_IMAGE_BEFORE_ROUND');
+  const newImageBlob = createMockImageBlob('NEW_IMAGE_OF_THIS_ROUND');
+  const laterImageBlob = createMockImageBlob('LATER_IMAGE_SAME_ROUND');
+  let currentClipboardBlob = oldImageBlob;
+
+  const clipboard = {
+    read: async () => [{
+      types: ['image/png'],
+      getType: async () => currentClipboardBlob,
+    }],
+  };
+
+  const client = setupRealClient({ clipboard });
+  const mainBtn = () => client.render().children.find((c) => c.props.key === 'main-btn');
+
+  await mainBtn().props.onClick();
+  const focusHandlers = Array.from(client.focusListeners);
+  assert.equal(focusHandlers.length, 1, '等待中挂上了焦点监听');
+
+  currentClipboardBlob = newImageBlob;
+  client.triggerFocus();
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(client.dispatchedEvents.length, 1, '新图插入一次');
+  assert.equal(client.liveIntervals(), 0, '插入后轮询定时器已清掉');
+  assert.equal(client.focusListeners.size, 0, '插入后焦点监听已移除');
+
+  // 同一轮里剪贴板又变了：就算旧的焦点回调又被调用、再等过两次轮询，也不能再插
+  currentClipboardBlob = laterImageBlob;
+  for (const fn of focusHandlers) fn();
+  client.triggerFocus();
+  await new Promise((r) => setTimeout(r, 1200));
+
+  assert.equal(client.dispatchedEvents.length, 1, '同一轮只插一张，不插后来的图');
+  assert.equal(client.dispatchedEvents[0].clipboardData.file._rawBuffer.toString('utf8'), 'NEW_IMAGE_OF_THIS_ROUND', '插入的是本轮的新图');
+
+  client.unmount();
+});
+
 test('3.1 [真实 index.js] 后端接口：非 Windows (linux/darwin) 请求返回 501 unsupported-platform', async () => {
   let registeredRoute = null;
   const mockCtx = {
@@ -822,6 +914,36 @@ test('3.2 [真实 index.js] 后端接口：Windows 上启动失败 (如无法启
   } finally {
     Object.defineProperty(process, 'platform', { value: origPlatform, configurable: true });
     process.env.PATH = origPath;
+  }
+});
+
+test('3.3 [真实 index.js] 后端接口：Windows 上 spawn 当场抛错 (同步异常) 也只能返回 500，不能说成功', async () => {
+  let registeredRoute = null;
+  screenshotBackend.apply({
+    effect: (fn) => fn(),
+    connection: { fetch: { register: (route) => { registeredRoute = route; } } },
+  });
+  assert.ok(registeredRoute);
+
+  // 把 node:child_process 的 spawn 临时换成“当场抛错”，并同步到插件用的 ESM 导入
+  const childProcess = createRequire(import.meta.url)('node:child_process');
+  const origSpawn = childProcess.spawn;
+  const origPlatform = process.platform;
+  try {
+    childProcess.spawn = () => {
+      throw new Error('EPERM: simulated synchronous spawn failure');
+    };
+    syncBuiltinESMExports();
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+
+    const resp = await registeredRoute.fetch(new Request('http://127.0.0.1/api/local/trigger-snipping', { method: 'POST' }));
+    assert.equal(resp.status, 500, 'spawn 当场抛错时必须返回 500');
+    const body = await resp.json();
+    assert.equal(body.ok, false, '返回内容不能说成功');
+  } finally {
+    childProcess.spawn = origSpawn;
+    syncBuiltinESMExports();
+    Object.defineProperty(process, 'platform', { value: origPlatform, configurable: true });
   }
 });
 
@@ -1144,4 +1266,222 @@ test('5.5 [真实 session-admin client.js] 前端菜单：后端返回 storage-i
   assert.equal(rendered.props.disabled, true, '存储不兼容时菜单项必须被禁用 (disabled=true)');
   const labelSpan = rendered.children.find((c) => c.props.className === 'dsa-menuitem-label');
   assert.equal(labelSpan.children[0], '当前 Harness 版本不支持', '菜单项文本必须显示为「当前 Harness 版本不支持」');
+});
+
+// ---------------------------------------------------------------------
+// 第五轮补充：删除接口、状态接口的存储检查，前端启动探测的登录凭据
+// ---------------------------------------------------------------------
+
+/** 用真实 session-admin index.js 注册路由，按路径收集起来，并记录宿主服务被调用的情况。 */
+function setupSessionAdminRoutes() {
+  const routes = {};
+  const calls = { agentsGet: 0, stat: 0, workspaceList: 0, emit: 0 };
+  const mockCtx = {
+    effect: (fn) => fn(),
+    logger: { warn: () => {}, info: () => {} },
+    connection: {
+      fetch: {
+        register: (route) => {
+          routes[route.path] = route;
+        },
+      },
+    },
+    agents: { get: () => { calls.agentsGet++; return undefined; } },
+    sessions: { list: () => [], get: () => undefined },
+    workspaceRegistry: { archivedSessionIds: [], list: () => { calls.workspaceList++; return []; } },
+    sessionPersistence: {
+      list: async () => [],
+      stat: async () => { calls.stat++; return { size: 1 }; },
+    },
+    emit: () => { calls.emit++; },
+  };
+  sessionAdminBackend.apply(mockCtx);
+  return { routes, calls };
+}
+
+/** 建一个结构完整的临时 DSH 目录。 */
+function makeCompleteDshHome(prefix) {
+  const home = mkdtempSync(join(tmpdir(), prefix));
+  mkdirSync(join(home, 'sessions'), { recursive: true });
+  mkdirSync(join(home, 'storages', 'session_projcache', 'sessions'), { recursive: true });
+  return home;
+}
+
+test('5.6 [真实 session-admin index.js] 状态接口：目录缺失或不是目录时报不兼容 (500 + storage-incompatible)，结构完整时才报兼容', async () => {
+  const { routes } = setupSessionAdminRoutes();
+  const statusRoute = routes['/api/sessionAdmin/status'];
+  assert.ok(statusRoute, 'status 路由已注册');
+
+  const origDshHome = process.env.DSH_HOME;
+  const getStatus = () => statusRoute.fetch(new Request('http://127.0.0.1/api/sessionAdmin/status', { method: 'GET' }));
+  const tempDirs = [];
+  try {
+    // A: DSH 目录不存在
+    process.env.DSH_HOME = join(tmpdir(), 'non_existent_dsh_status_' + Date.now());
+    let resp = await getStatus();
+    assert.equal(resp.status, 500, 'DSH 目录不存在时状态接口返回 500');
+    let body = await resp.json();
+    assert.equal(body.ok, false);
+    assert.equal(body.error.code, 'session-admin/storage-incompatible');
+
+    // B: 缺缓存目录
+    const noCache = mkdtempSync(join(tmpdir(), 'dsh_status_nocache_'));
+    tempDirs.push(noCache);
+    mkdirSync(join(noCache, 'sessions'), { recursive: true });
+    process.env.DSH_HOME = noCache;
+    resp = await getStatus();
+    assert.equal(resp.status, 500, '缺缓存目录时状态接口返回 500');
+    body = await resp.json();
+    assert.equal(body.error.code, 'session-admin/storage-incompatible');
+
+    // C: sessions 是文件不是目录
+    const fileNotDir = mkdtempSync(join(tmpdir(), 'dsh_status_file_'));
+    tempDirs.push(fileNotDir);
+    writeFileSync(join(fileNotDir, 'sessions'), 'not_a_directory');
+    mkdirSync(join(fileNotDir, 'storages', 'session_projcache', 'sessions'), { recursive: true });
+    process.env.DSH_HOME = fileNotDir;
+    resp = await getStatus();
+    assert.equal(resp.status, 500, 'sessions 是文件时状态接口返回 500');
+    body = await resp.json();
+    assert.equal(body.error.code, 'session-admin/storage-incompatible');
+
+    // D: 结构完整
+    const complete = makeCompleteDshHome('dsh_status_ok_');
+    tempDirs.push(complete);
+    process.env.DSH_HOME = complete;
+    resp = await getStatus();
+    assert.equal(resp.status, 200, '结构完整时状态接口返回 200');
+    body = await resp.json();
+    assert.deepEqual(body, { ok: true, value: { compatible: true } });
+  } finally {
+    process.env.DSH_HOME = origDshHome;
+    for (const d of tempDirs) rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('5.7 [真实 session-admin index.js] 删除接口：先查存储再读请求；第一道检查之后目录才消失，删除流程开始前也要再拦一次，宿主服务一个都不碰', async () => {
+  const origDshHome = process.env.DSH_HOME;
+
+  // A: 存储不兼容时，连请求内容都不读，直接 500 storage-incompatible（请求内容本身是坏的 JSON，读了就会变成 400）
+  {
+    const { routes, calls } = setupSessionAdminRoutes();
+    const deleteRoute = routes['/api/sessionAdmin/delete'];
+    assert.ok(deleteRoute, 'delete 路由已注册');
+    try {
+      process.env.DSH_HOME = join(tmpdir(), 'non_existent_dsh_delete_' + Date.now());
+      let bodyRead = false;
+      const resp = await deleteRoute.fetch({
+        method: 'POST',
+        text: async () => { bodyRead = true; return 'this is not json'; },
+      });
+      assert.equal(resp.status, 500, '存储不兼容时删除接口返回 500，而不是读请求后的 400');
+      const body = await resp.json();
+      assert.equal(body.error.code, 'session-admin/storage-incompatible');
+      assert.equal(bodyRead, false, '存储不兼容时不读请求内容');
+      assert.equal(calls.agentsGet + calls.stat + calls.workspaceList + calls.emit, 0, '没有碰任何宿主服务');
+    } finally {
+      process.env.DSH_HOME = origDshHome;
+    }
+  }
+
+  // B: 第一道检查时结构完整，读请求内容期间 sessions 目录被删掉 -> 删除流程里的检查必须拦住
+  {
+    const { routes, calls } = setupSessionAdminRoutes();
+    const deleteRoute = routes['/api/sessionAdmin/delete'];
+    const home = makeCompleteDshHome('dsh_delete_race_');
+    try {
+      process.env.DSH_HOME = home;
+      const resp = await deleteRoute.fetch({
+        method: 'POST',
+        text: async () => {
+          rmSync(join(home, 'sessions'), { recursive: true, force: true });
+          return JSON.stringify({ sessionId: 'race-session' });
+        },
+      });
+      assert.equal(resp.status, 500, '目录中途消失时删除接口返回 500');
+      const body = await resp.json();
+      assert.equal(body.error.code, 'session-admin/storage-incompatible');
+      assert.equal(calls.agentsGet, 0, '没有去查 Agent');
+      assert.equal(calls.stat, 0, '没有去查会话存储');
+      assert.equal(calls.workspaceList, 0, '没有改工作区登记');
+      assert.equal(calls.emit, 0, '没有发出「会话已删除」');
+    } finally {
+      process.env.DSH_HOME = origDshHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  }
+});
+
+test('5.8 [真实 session-admin client.js] 前端启动探测：用 GET 请求状态接口，带登录凭据 (credentials: include)，地址按 baseURI 解析；后端报兼容时菜单可用', async () => {
+  let capturedFactory = null;
+  const fetchCalls = [];
+  const sandbox = {
+    window: {
+      __ModuleLoader__: {
+        load: (mod) => { capturedFactory = mod.factory; },
+      },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    },
+    document: {
+      baseURI: 'http://127.0.0.1:54732/app/subpath/',
+      head: { appendChild: () => {} },
+      createElement: () => ({ dataset: {}, remove: () => {} }),
+    },
+    fetch: async (url, opts) => {
+      fetchCalls.push({ url: String(url), opts: opts || {} });
+      return { ok: true, status: 200, json: async () => ({ ok: true, value: { compatible: true } }) };
+    },
+    URL: globalThis.URL,
+    console,
+  };
+
+  vm.createContext(sandbox);
+  vm.runInContext(sessionAdminClientSource, sandbox);
+  assert.ok(capturedFactory, '成功捕获真实 session-admin client factory');
+
+  const mockReact = {
+    useState: (init) => [init, () => {}],
+    useRef: (init) => ({ current: init }),
+    useEffect: (fn) => { fn(); },
+    useCallback: (fn) => fn,
+    useSyncExternalStore: (sub, getSnapshot) => getSnapshot(),
+    createElement: (type, props, ...children) => ({ type, props: props || {}, children: children.flat() }),
+  };
+  const plugin = capturedFactory((id) => (id === 'react' ? mockReact : {}));
+
+  let registeredMenuItem = null;
+  plugin.apply({
+    effect: (fn) => fn(),
+    locale: {
+      bind: () => (key) => (key === 'menu.unsupported' ? '当前 Harness 版本不支持' : '删除会话'),
+      register: () => {},
+    },
+    slots: {
+      inject: (slot, genFn) => {
+        if (slot === 'sidebar.workspaces.session.menu.item') {
+          for (const item of genFn()) registeredMenuItem = item;
+        }
+      },
+      register: (opts, comp) => comp,
+    },
+  });
+
+  await new Promise((r) => setTimeout(r, 60));
+
+  const statusCalls = fetchCalls.filter((c) => c.url.includes('sessionAdmin/status'));
+  assert.equal(statusCalls.length, 1, '启动时探测一次状态接口');
+  assert.equal(statusCalls[0].url, 'http://127.0.0.1:54732/app/subpath/api/sessionAdmin/status', '地址按 baseURI 解析');
+  assert.equal(statusCalls[0].opts.method, 'GET', '用 GET 请求');
+  assert.equal(statusCalls[0].opts.credentials, 'include', '探测必须带登录凭据');
+
+  assert.ok(registeredMenuItem, '注册了侧边栏会话菜单组件');
+  const rendered = registeredMenuItem({
+    sessionId: 'test-session',
+    displayTitle: 'Test',
+    useMenuOpenState: () => [true, () => {}],
+    t: (key) => (key === 'menu.unsupported' ? '当前 Harness 版本不支持' : '删除会话'),
+    requestDelete: () => {},
+  });
+  assert.equal(rendered.props.disabled, false, '后端报兼容时菜单项可用');
 });

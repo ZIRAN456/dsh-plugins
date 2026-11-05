@@ -7,6 +7,7 @@ export function apply(ctx) {
     return ctx.connection.fetch.register({
       path: '/api/local/trigger-snipping',
       methods: ['POST'],
+      requestBody: 'buffered',
       fetch: async () => {
         if (process.platform !== 'win32') {
           return new Response(JSON.stringify({ ok: false, error: 'unsupported-platform' }), {

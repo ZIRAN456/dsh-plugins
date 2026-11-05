@@ -4,6 +4,9 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const h = React.createElement;
 
+    /** Browser-relative route matching connection.fetch (keeps base path working) */
+    const SNIP_ROUTE = 'api/local/trigger-snipping';
+
     // Helper: insert image file into composer (single dispatch only to avoid duplicates)
     function insertImageFile(file) {
       const editor = document.querySelector('div[contenteditable="true"], div[contenteditable="plaintext-only"], [role="textbox"], .cm-content');
@@ -104,7 +107,10 @@ window.__ModuleLoader__.load({
 
         // 2. Trigger Windows native screen snipping via Host endpoint
         try {
-          const resp = await fetch('/api/local/trigger-snipping', { method: 'POST' });
+          const resp = await fetch(new URL(SNIP_ROUTE, document.baseURI).href, {
+            method: 'POST',
+            credentials: 'include',
+          });
           if (!resp.ok) {
             console.warn('[ScreenshotButton] trigger snipping rejected with status:', resp.status);
             setStatus('idle');

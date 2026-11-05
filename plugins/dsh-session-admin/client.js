@@ -15,6 +15,9 @@ window.__ModuleLoader__.load({
     /** Route the browser posts a storage-inventory request to. */
     const INVENTORY_ROUTE = 'api/sessionAdmin/inventory';
 
+    /** Route the browser probes storage compatibility with. */
+    const STATUS_ROUTE = 'api/sessionAdmin/status';
+
     /** Main-panel key of the cleanup page, also its sidebar launcher id. */
     const PANEL_ID = 'session-admin-cleanup';
 
@@ -25,6 +28,7 @@ window.__ModuleLoader__.load({
 
     const zh = {
       'menu.deleteSession': '删除会话',
+      'menu.unsupported': '当前 Harness 版本不支持',
       'dialog.title': '删除会话',
       'dialog.desc': '将把“{title}”及其全部对话记录永久删除。此操作无法撤销。',
       'dialog.note': '会话日志与投影缓存会一并清除。',
@@ -68,6 +72,7 @@ window.__ModuleLoader__.load({
 
     const en = {
       'menu.deleteSession': 'Delete session',
+      'menu.unsupported': 'Unsupported in this Harness version',
       'dialog.title': 'Delete session',
       'dialog.desc': '"{title}" and its whole conversation log will be permanently deleted. This cannot be undone.',
       'dialog.note':
@@ -145,6 +150,9 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /** Track whether the current DSH version and storage layout is supported. */
+    const supportStore = createStore(true);
+
     /** Human-readable byte size for the result notice. */
     function formatBytes(bytes) {
       if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
@@ -182,6 +190,9 @@ window.__ModuleLoader__.load({
       const failure = payload?.error;
       const error = new Error(typeof failure?.message === 'string' ? failure.message : `HTTP ${String(response.status)}`);
       error.code = typeof failure?.code === 'string' ? failure.code : 'session-admin/internal';
+      if (error.code === 'session-admin/storage-incompatible') {
+        supportStore.set(false);
+      }
       throw error;
     }
 
@@ -290,20 +301,25 @@ window.__ModuleLoader__.load({
     function DeleteSessionMenuItem({ sessionId, displayTitle, useMenuOpenState, t, requestDelete }) {
       const [menuOpen, setMenuOpen] = typeof useMenuOpenState === 'function' ? useMenuOpenState() : [false, () => {}];
       void menuOpen;
+      const supported = useStore(supportStore);
       return h(
         'button',
         {
           type: 'button',
           role: 'menuitem',
           className: 'dsa-menuitem',
-          'data-danger': '',
+          'data-danger': supported ? '' : undefined,
+          disabled: !supported,
+          style: supported ? {} : { opacity: 0.6, cursor: 'not-allowed' },
+          title: supported ? '' : t('menu.unsupported'),
           onClick: () => {
+            if (!supported) return;
             setMenuOpen(false);
             requestDelete(sessionId, displayTitle);
           },
         },
         h('span', { className: 'dsa-menuitem-icon' }, h(TrashIcon, { size: 14 })),
-        h('span', { className: 'dsa-menuitem-label' }, t('menu.deleteSession')),
+        h('span', { className: 'dsa-menuitem-label' }, supported ? t('menu.deleteSession') : t('menu.unsupported')),
       );
     }
 
@@ -746,6 +762,20 @@ window.__ModuleLoader__.load({
         const requests = createStore(null);
         const notice = createStore(null);
         const t = ctx.locale.bind(NS);
+
+        // Proactively probe storage compatibility on startup to reflect in menu immediately
+        fetch(new URL(STATUS_ROUTE, document.baseURI).href, {
+          method: 'GET',
+          credentials: 'include',
+        })
+          .then((res) => res.json())
+          .then((data) => {
+            if (data?.ok !== true || data?.error?.code === 'session-admin/storage-incompatible') {
+              supportStore.set(false);
+            }
+          })
+          .catch(() => {});
+
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'session-admin: dictionaries');
         ctx.effect(() => {
           const tag = document.createElement('style');

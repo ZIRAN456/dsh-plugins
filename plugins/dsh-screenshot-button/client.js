@@ -4,6 +4,9 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const h = React.createElement;
 
+    /** Browser-relative route matching connection.fetch (keeps base path working) */
+    const SNIP_ROUTE = 'api/local/trigger-snipping';
+
     // Helper: insert image file into composer (single dispatch only to avoid duplicates)
     function insertImageFile(file) {
       const editor = document.querySelector('div[contenteditable="true"], div[contenteditable="plaintext-only"], [role="textbox"], .cm-content');
@@ -42,16 +45,15 @@ window.__ModuleLoader__.load({
       return false;
     }
 
-    // Helper: read image from clipboard
-    async function readImageFromClipboard() {
+    // Helper: read image blob from clipboard
+    async function readImageBlobFromClipboard() {
       if (!navigator.clipboard || !navigator.clipboard.read) return null;
       try {
         const items = await navigator.clipboard.read();
         for (const item of items) {
           for (const type of item.types) {
             if (type.startsWith('image/')) {
-              const blob = await item.getType(type);
-              return new File([blob], `screenshot-${Date.now()}.png`, { type: blob.type || 'image/png' });
+              return await item.getType(type);
             }
           }
         }
@@ -61,17 +63,97 @@ window.__ModuleLoader__.load({
       return null;
     }
 
+    // Helper: compute SHA-256 content fingerprint for an image blob
+    async function computeBlobFingerprint(blob) {
+      if (!blob) return null;
+      try {
+        const buffer = await blob.arrayBuffer();
+        const digest = await crypto.subtle.digest('SHA-256', buffer);
+        const hashArray = Array.from(new Uint8Array(digest));
+        const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        return `${blob.size}:${hashHex}`;
+      } catch (err) {
+        console.warn('[ScreenshotButton] Failed to compute image fingerprint:', err);
+        return null;
+      }
+    }
+
+    /**
+     * Read baseline clipboard image state before snipping.
+     * Distinguishes 3 outcomes:
+     *   { status: 'has-image', blob: Blob, fingerprint: string }
+     *   { status: 'empty', blob: null, fingerprint: null }
+     *   { status: 'failed', error: Error | string }
+     */
+    async function getClipboardBaseline() {
+      if (!navigator.clipboard || typeof navigator.clipboard.read !== 'function') {
+        return { status: 'failed', error: new Error('navigator.clipboard.read API is not available') };
+      }
+      let items;
+      try {
+        items = await navigator.clipboard.read();
+      } catch (err) {
+        return { status: 'failed', error: err };
+      }
+
+      let imageBlob = null;
+      for (const item of items) {
+        for (const type of item.types) {
+          if (type.startsWith('image/')) {
+            try {
+              imageBlob = await item.getType(type);
+              break;
+            } catch (err) {
+              return { status: 'failed', error: err };
+            }
+          }
+        }
+        if (imageBlob) break;
+      }
+
+      if (!imageBlob) {
+        return { status: 'empty', blob: null, fingerprint: null };
+      }
+
+      try {
+        const fingerprint = await computeBlobFingerprint(imageBlob);
+        if (!fingerprint) {
+          return { status: 'failed', error: new Error('Failed to compute image fingerprint') };
+        }
+        return { status: 'has-image', blob: imageBlob, fingerprint };
+      } catch (err) {
+        return { status: 'failed', error: err };
+      }
+    }
+
     function ScreenshotToolbarControl() {
       const [status, setStatus] = React.useState('idle'); // 'idle' | 'capturing' | 'success'
       const [hoverScreenshot, setHoverScreenshot] = React.useState(false);
       const [hoverPaste, setHoverPaste] = React.useState(false);
+      const isCapturingRef = React.useRef(false);
+      const activeCycleRef = React.useRef(null);
+      const isUnmountedRef = React.useRef(false);
       const isZh = typeof navigator !== 'undefined' && (navigator.language || '').toLowerCase().startsWith('zh');
       const isWin = typeof navigator !== 'undefined' && /windows|win32/i.test(navigator.userAgent || navigator.platform || '');
 
+      React.useEffect(() => {
+        isUnmountedRef.current = false;
+        return () => {
+          isUnmountedRef.current = true;
+          if (activeCycleRef.current) {
+            activeCycleRef.current.abort();
+            activeCycleRef.current = null;
+          }
+          isCapturingRef.current = false;
+        };
+      }, []);
+
       const handlePasteDirect = async () => {
+        if (isCapturingRef.current) return;
         setStatus('capturing');
-        const file = await readImageFromClipboard();
-        if (file) {
+        const blob = await readImageBlobFromClipboard();
+        if (blob) {
+          const file = new File([blob], `screenshot-${Date.now()}.png`, { type: blob.type || 'image/png' });
           insertImageFile(file);
           setStatus('success');
           setTimeout(() => setStatus('idle'), 1600);
@@ -81,54 +163,126 @@ window.__ModuleLoader__.load({
       };
 
       const handleScreenshot = async () => {
+        // Synchronous lock immediately on click: prevent click gap and multiple concurrent backend calls
+        if (isCapturingRef.current || isUnmountedRef.current) return;
+        isCapturingRef.current = true;
         setStatus('capturing');
 
-        // 1. Record baseline clipboard image size to prevent pasting stale image if user cancels
-        const baseline = await readImageFromClipboard();
-        const baselineFingerprint = baseline ? `${baseline.size}_${baseline.lastModified}` : 'empty';
+        let handled = false;
+        let pollTimer = null;
+        let expireTimer = null;
+        let onFocus = null;
+
+        const cleanup = () => {
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+          if (expireTimer) { clearTimeout(expireTimer); expireTimer = null; }
+          if (onFocus) {
+            window.removeEventListener('focus', onFocus);
+            onFocus = null;
+          }
+          if (activeCycleRef.current === cycle) {
+            activeCycleRef.current = null;
+          }
+          isCapturingRef.current = false;
+        };
+
+        const cycle = {
+          aborted: false,
+          abort: () => {
+            cycle.aborted = true;
+            handled = true;
+            cleanup();
+            if (!isUnmountedRef.current) setStatus('idle');
+          },
+        };
+        activeCycleRef.current = cycle;
+
+        // 1. Calculate baseline image fingerprint (bytes + SHA-256) before snipping
+        const baseline = await getClipboardBaseline();
+        if (cycle.aborted || isUnmountedRef.current) {
+          cleanup();
+          return;
+        }
+
+        if (baseline.status === 'failed') {
+          console.warn('[ScreenshotButton] Clipboard baseline read or fingerprint calculation failed, aborting capture:', baseline.error);
+          cleanup();
+          if (!isUnmountedRef.current) setStatus('idle');
+          return;
+        }
+
+        const baselineFingerprint = baseline.fingerprint;
 
         // 2. Trigger Windows native screen snipping via Host endpoint
         try {
-          const resp = await fetch('/api/local/trigger-snipping', { method: 'POST' });
+          const resp = await fetch(new URL(SNIP_ROUTE, document.baseURI).href, {
+            method: 'POST',
+            credentials: 'include',
+          });
+          if (cycle.aborted || isUnmountedRef.current) {
+            cleanup();
+            return;
+          }
           if (!resp.ok) {
-            console.warn('[ScreenshotButton] trigger snipping responded with status:', resp.status);
+            console.warn('[ScreenshotButton] trigger snipping rejected with status:', resp.status);
+            cleanup();
+            if (!isUnmountedRef.current) setStatus('idle');
+            return;
           }
         } catch (err) {
           console.warn('[ScreenshotButton] trigger snipping error:', err);
+          cleanup();
+          if (!isUnmountedRef.current) setStatus('idle');
+          return;
         }
 
-        // 3. Listen for window focus: only check clipboard when focus returns after snip
-        let handled = false;
-        const onFocus = () => {
-          window.removeEventListener('focus', onFocus);
-          setTimeout(async () => {
-            if (handled) return;
-            const latest = await readImageFromClipboard();
-            if (!latest) {
-              setStatus('idle');
-              return;
-            }
-            const latestFingerprint = `${latest.size}_${latest.lastModified}`;
-            // Only insert if clipboard has a newly captured image
-            if (baselineFingerprint === 'empty' || latestFingerprint !== baselineFingerprint) {
+        if (cycle.aborted || isUnmountedRef.current) {
+          cleanup();
+          return;
+        }
+
+        // 3. Continuously poll every 500ms and check immediately on window focus, up to 12s
+        let inFlight = false;
+
+        const checkClipboard = async () => {
+          if (handled || inFlight || cycle.aborted || isUnmountedRef.current) return;
+          inFlight = true;
+          try {
+            const currentBlob = await readImageBlobFromClipboard();
+            if (!currentBlob || handled || cycle.aborted || isUnmountedRef.current) return;
+            const currentFingerprint = await computeBlobFingerprint(currentBlob);
+            if (currentFingerprint && currentFingerprint !== baselineFingerprint && !handled && !cycle.aborted && !isUnmountedRef.current) {
               handled = true;
-              insertImageFile(latest);
-              setStatus('success');
-              setTimeout(() => setStatus('idle'), 1600);
-            } else {
-              // User canceled or clipboard didn't update: do not paste old image
-              setStatus('idle');
+              cleanup();
+              const file = new File([currentBlob], `screenshot-${Date.now()}.png`, { type: currentBlob.type || 'image/png' });
+              insertImageFile(file);
+              if (!isUnmountedRef.current) {
+                setStatus('success');
+                setTimeout(() => {
+                  if (!isUnmountedRef.current) setStatus('idle');
+                }, 1600);
+              }
             }
-          }, 350);
+          } finally {
+            inFlight = false;
+          }
+        };
+
+        onFocus = () => {
+          checkClipboard();
+          setTimeout(checkClipboard, 350);
         };
 
         window.addEventListener('focus', onFocus);
+        pollTimer = setInterval(checkClipboard, 500);
 
-        // Safety timeout to clean up listener if user stays away
-        setTimeout(() => {
-          window.removeEventListener('focus', onFocus);
-          setStatus((prev) => (prev === 'capturing' ? 'idle' : prev));
-        }, 30000);
+        // Expire after 12 seconds: restore button and do not insert anything
+        expireTimer = setTimeout(() => {
+          if (!handled) {
+            cleanup();
+            if (!isUnmountedRef.current) setStatus('idle');
+          }
+        }, 12000);
       };
 
       const containerStyle = {
@@ -211,27 +365,31 @@ window.__ModuleLoader__.load({
       if (status === 'capturing') textLabel = isZh ? '等待框选...' : 'Snipping...';
       if (status === 'success') textLabel = isZh ? '✓ 已插入' : '✓ Inserted';
 
-      const screenshotTooltip = isWin
-        ? (isZh ? '唤起系统截图 (Win+Shift+S)，框选后切回自动插入' : 'Trigger Windows Snip (Win+Shift+S) and auto-insert')
-        : (isZh ? '系统截图仅支持 Windows；可在外部截图后点击【贴图】' : 'Native snip is Windows-only; use Paste after screenshotting');
+      const controls = [];
+      if (isWin) {
+        const isBusy = status === 'capturing' || isCapturingRef.current;
+        controls.push(
+          h('button', {
+            key: 'main-btn',
+            type: 'button',
+            disabled: isBusy,
+            style: {
+              ...screenshotBtnStyle,
+              cursor: isBusy ? 'default' : 'pointer',
+              opacity: isBusy ? 0.85 : 1,
+            },
+            title: isZh ? '唤起系统截图 (Win+Shift+S)，框选后切回自动插入' : 'Trigger Windows Snip (Win+Shift+S) and auto-insert',
+            onClick: handleScreenshot,
+            onMouseEnter: () => setHoverScreenshot(true),
+            onMouseLeave: () => setHoverScreenshot(false),
+          }, [
+            cameraSvg,
+            h('span', { key: 'txt' }, textLabel),
+          ])
+        );
+      }
 
-      return h('div', {
-        style: containerStyle,
-      }, [
-        // Screenshot button
-        h('button', {
-          key: 'main-btn',
-          type: 'button',
-          style: screenshotBtnStyle,
-          title: screenshotTooltip,
-          onClick: handleScreenshot,
-          onMouseEnter: () => setHoverScreenshot(true),
-          onMouseLeave: () => setHoverScreenshot(false),
-        }, [
-          cameraSvg,
-          h('span', { key: 'txt' }, textLabel),
-        ]),
-        // Paste button
+      controls.push(
         h('button', {
           key: 'clip-btn',
           type: 'button',
@@ -243,8 +401,12 @@ window.__ModuleLoader__.load({
           },
           onMouseEnter: () => setHoverPaste(true),
           onMouseLeave: () => setHoverPaste(false),
-        }, isZh ? '贴图' : 'Paste'),
-      ]);
+        }, isZh ? '贴图' : 'Paste')
+      );
+
+      return h('div', {
+        style: containerStyle,
+      }, controls);
     }
 
     return {

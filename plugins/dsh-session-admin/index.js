@@ -29,6 +29,9 @@ const DELETE_PATH = '/api/sessionAdmin/delete';
 /** Route the browser posts a storage-inventory request to. */
 const INVENTORY_PATH = '/api/sessionAdmin/inventory';
 
+/** Route the browser probes storage compatibility with. */
+const STATUS_PATH = '/api/sessionAdmin/status';
+
 /**
  * Path of the durable cleanup queue: Sessions whose registry rows are already
  * gone but whose log files must still be unlinked at the next start, because a
@@ -213,6 +216,39 @@ async function detachFromWorkspaces(ctx, sessionId) {
 }
 
 /**
+ * Preflight verification: ensure storage structure matches supported DSH layout.
+ * Requires:
+ *   1. DSH home directory
+ *   2. sessions directory
+ *   3. storages/session_projcache/sessions directory
+ * Returns { valid: true } or { valid: false, reason: string }.
+ */
+async function verifyStorageStructure() {
+  const home = dshHome();
+  const sessionsDir = join(home, 'sessions');
+  const projCacheDir = join(home, 'storages', 'session_projcache', 'sessions');
+
+  const targets = [
+    { name: 'DSH home directory', path: home },
+    { name: 'Sessions directory', path: sessionsDir },
+    { name: 'Projection cache directory', path: projCacheDir },
+  ];
+
+  for (const target of targets) {
+    try {
+      const s = await stat(target.path);
+      if (!s.isDirectory()) {
+        return { valid: false, reason: `${target.name} at "${target.path}" is not a directory` };
+      }
+    } catch {
+      return { valid: false, reason: `${target.name} not found at "${target.path}"` };
+    }
+  }
+
+  return { valid: true };
+}
+
+/**
  * Permanently delete one Session.
  *
  * A Session whose Agent is resident in this process still holds its log in
@@ -228,6 +264,10 @@ async function detachFromWorkspaces(ctx, sessionId) {
  * @throws {DeleteFailure} for a missing id or a running Agent.
  */
 async function deleteSession(ctx, sessionId) {
+  const storageCheck = await verifyStorageStructure();
+  if (!storageCheck.valid) {
+    throw new DeleteFailure(500, 'session-admin/storage-incompatible', storageCheck.reason);
+  }
   if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
     throw new DeleteFailure(400, 'session-admin/invalid-id', 'sessionId must be a non-empty string');
   }
@@ -378,6 +418,13 @@ function jsonResponse(body, status = 200) {
  */
 async function handleDeleteHttp(ctx, request) {
   if (request.method !== 'POST') return new Response(null, { status: 405, headers: { allow: 'POST' } });
+  const storageCheck = await verifyStorageStructure();
+  if (!storageCheck.valid) {
+    return jsonResponse(
+      { ok: false, error: { code: 'session-admin/storage-incompatible', message: storageCheck.reason, details: {} } },
+      500,
+    );
+  }
   try {
     const body = await readJsonBody(request);
     return jsonResponse({ ok: true, value: await deleteSession(ctx, body.sessionId) });
@@ -458,6 +505,13 @@ async function inventory(ctx) {
  */
 async function handleInventoryHttp(ctx, request) {
   if (request.method !== 'POST') return new Response(null, { status: 405, headers: { allow: 'POST' } });
+  const storageCheck = await verifyStorageStructure();
+  if (!storageCheck.valid) {
+    return jsonResponse(
+      { ok: false, error: { code: 'session-admin/storage-incompatible', message: storageCheck.reason, details: {} } },
+      500,
+    );
+  }
   try {
     return jsonResponse({ ok: true, value: await inventory(ctx) });
   } catch (error) {
@@ -468,11 +522,44 @@ async function handleInventoryHttp(ctx, request) {
 }
 
 /**
+ * Handle one authenticated status probe request.
+ *
+ * @param ctx - Host context owning the operation.
+ * @param request - authenticated HTTP request from Connection.
+ * @returns compatibility status.
+ */
+async function handleStatusHttp(ctx, request) {
+  if (request.method !== 'GET') return new Response(null, { status: 405, headers: { allow: 'GET' } });
+  const storageCheck = await verifyStorageStructure();
+  if (!storageCheck.valid) {
+    return jsonResponse(
+      { ok: false, error: { code: 'session-admin/storage-incompatible', message: storageCheck.reason, details: {} } },
+      500,
+    );
+  }
+  return jsonResponse({ ok: true, value: { compatible: true } });
+}
+
+/**
  * Register the authenticated deletion and inventory routes for the browser half.
  *
  * @param ctx - Host context carrying Connection, Session, Workspace, and storage services.
  */
 export function apply(ctx) {
+  verifyStorageStructure().then((res) => {
+    if (!res.valid) {
+      ctx.logger?.warn?.(`[session-admin] Storage structure incompatible: ${res.reason}. Session admin operations disabled.`);
+    }
+  });
+  ctx.effect(
+    () =>
+      ctx.connection.fetch.register({
+        path: STATUS_PATH,
+        methods: ['GET'],
+        fetch: (request) => handleStatusHttp(ctx, request),
+      }),
+    'session-admin: status route',
+  );
   ctx.effect(
     () =>
       ctx.connection.fetch.register({

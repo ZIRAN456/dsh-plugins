@@ -9,11 +9,11 @@
 
 ## 💻 兼容性与运行环境
 
-* **测试通过平台**：Windows 11 / macOS / Linux
-* **Harness 版本**：DeepSeek Harness v0.2.x
+* **测试环境**：Windows 11 Pro 64-bit（已附端到端与 curl 实测记录，macOS / Linux 未在实体机实测）
+* **Harness 版本**：DeepSeek Harness v0.2.1-rc.5
 * **系统差异说明**：
-  * `dsh-screenshot-button` 的「截图」按钮依赖系统原生调用，目前支持 Windows 11/10；「贴图」功能跨平台通用；
-  * `dsh-session-admin` 与 `dsh-warm-sage-theme` 为全平台通用。
+  * `dsh-screenshot-button` 的「截图」按钮依赖 Windows 原生工具（非 Windows 环境自动隐藏该按钮，仅保留「贴图」）；
+  * 「贴图」功能、`dsh-session-admin` 以及 `dsh-warm-sage-theme` 理论跨平台通用。
 
 ---
 
@@ -23,9 +23,10 @@
 > 目录：`plugins/dsh-screenshot-button`
 
 在对话框底栏新增快捷操作按钮：
-* **原生自由截图**：点击「截图」唤起 Windows 原生自由框选截图（`Win + Shift + S` / SnippingTool），完成框选切回窗口自动插入图片。具备剪贴板指纹比对防护，取消框选不会误插剪贴板旧图；
+* **原生自由截图**：点击「截图」唤起 Windows 原生自由框选截图（`Win + Shift + S` / SnippingTool），完成框选切回窗口自动插入图片。具备剪贴板三态探测（区分空/有图/读取失败）与 SHA-256 内容指纹防护，取消框选绝不插入旧图；
+* **防重复与单轮锁定**：截图等待期间按钮锁定并支持新一轮彻底取消旧轮，防止连续点击插入多份图片；组件卸载自动清理监听与定时器；
 * **一键贴图**：点击「贴图」一键读取系统剪贴板最近的截图并插入输入框，免去鼠标点击输入框再按 `Ctrl + V`；
-* **双通道鉴权**：接口基于 `connection.fetch` 注册并走会话身份验证，杜绝外部网页 CSRF 恶意调用；
+* **会话身份鉴权**：接口基于 `connection.fetch` 注册，受宿主会话登录态保护（未授权调用直接返回 401 Unauthorized）；
 * **原生风格设计**：无突兀边框，透明背景，字体与高度和原生工具栏无缝融合，支持双按钮独立悬停高亮。
 
 ### 2. 🗑️ 历史会话彻底删除插件 (`dsh-session-admin`)
@@ -34,7 +35,8 @@
 解决官方默认只能“归档会话”无法彻底清理的痛点：
 * **侧边栏一键删除**：在左侧会话历史的右键 / `...` 菜单中增加“彻底删除”选项；
 * **深度物理清理**：同步清理会话登记信息 (Session Registry)、投影缓存、JSONL 磁盘会话日志与文件碎片；
-* **安全保护**：具备二次确认框提示，自动识别活跃运行中会话并拒绝删除，会话 ID 严格做注入转码与安全路径校验，避免内核死锁与路径穿越。
+* **存储布局启动与前置双重校验**：启动期与执行前严格校验 DSH 根目录、`sessions` 目录及 `session_projcache/sessions` 目录完整性，结构异常时日志警告并返回 `session-admin/storage-incompatible`，前端侧边栏菜单初始化即探测并显示为“当前 Harness 版本不支持”（若后续手动修复目录结构，需刷新页面恢复）；
+* **内核安全保护**：具备二次确认框提示，自动识别活跃运行中会话并拒绝删除，会话 ID 严格做注入转码与安全路径校验，避免内核死锁与路径穿越。
 
 ### 3. 🌿 温润鼠尾草绿主题 (`dsh-warm-sage-theme`)
 > 目录：`plugins/dsh-warm-sage-theme`
@@ -56,7 +58,7 @@
    > “帮我安装这个插件：`<插件所在的绝对路径>`”
    
    例如：
-   > “帮我安装这个插件：`C:/Users/admin/Documents/deepseek-harness/default-workspace/dsh-plugins/plugins/dsh-screenshot-button`”
+   > “帮我安装这个插件：`C:/Users/<Username>/dsh-plugins/plugins/dsh-screenshot-button`”
 
 3. Harness 将自动通过 `plugin_manager` 注册并热更新激活插件，无需重启。
 

@@ -106,10 +106,14 @@ window.__ModuleLoader__.load({
         try {
           const resp = await fetch('/api/local/trigger-snipping', { method: 'POST' });
           if (!resp.ok) {
-            console.warn('[ScreenshotButton] trigger snipping responded with status:', resp.status);
+            console.warn('[ScreenshotButton] trigger snipping rejected with status:', resp.status);
+            setStatus('idle');
+            return;
           }
         } catch (err) {
           console.warn('[ScreenshotButton] trigger snipping error:', err);
+          setStatus('idle');
+          return;
         }
 
         // 3. Continuously poll every 500ms and check immediately on window focus, up to 12s
@@ -235,27 +239,25 @@ window.__ModuleLoader__.load({
       if (status === 'capturing') textLabel = isZh ? '等待框选...' : 'Snipping...';
       if (status === 'success') textLabel = isZh ? '✓ 已插入' : '✓ Inserted';
 
-      const screenshotTooltip = isWin
-        ? (isZh ? '唤起系统截图 (Win+Shift+S)，框选后切回自动插入' : 'Trigger Windows Snip (Win+Shift+S) and auto-insert')
-        : (isZh ? '系统截图仅支持 Windows；可在外部截图后点击【贴图】' : 'Native snip is Windows-only; use Paste after screenshotting');
+      const controls = [];
+      if (isWin) {
+        controls.push(
+          h('button', {
+            key: 'main-btn',
+            type: 'button',
+            style: screenshotBtnStyle,
+            title: isZh ? '唤起系统截图 (Win+Shift+S)，框选后切回自动插入' : 'Trigger Windows Snip (Win+Shift+S) and auto-insert',
+            onClick: handleScreenshot,
+            onMouseEnter: () => setHoverScreenshot(true),
+            onMouseLeave: () => setHoverScreenshot(false),
+          }, [
+            cameraSvg,
+            h('span', { key: 'txt' }, textLabel),
+          ])
+        );
+      }
 
-      return h('div', {
-        style: containerStyle,
-      }, [
-        // Screenshot button
-        h('button', {
-          key: 'main-btn',
-          type: 'button',
-          style: screenshotBtnStyle,
-          title: screenshotTooltip,
-          onClick: handleScreenshot,
-          onMouseEnter: () => setHoverScreenshot(true),
-          onMouseLeave: () => setHoverScreenshot(false),
-        }, [
-          cameraSvg,
-          h('span', { key: 'txt' }, textLabel),
-        ]),
-        // Paste button
+      controls.push(
         h('button', {
           key: 'clip-btn',
           type: 'button',
@@ -267,8 +269,12 @@ window.__ModuleLoader__.load({
           },
           onMouseEnter: () => setHoverPaste(true),
           onMouseLeave: () => setHoverPaste(false),
-        }, isZh ? '贴图' : 'Paste'),
-      ]);
+        }, isZh ? '贴图' : 'Paste')
+      );
+
+      return h('div', {
+        style: containerStyle,
+      }, controls);
     }
 
     return {

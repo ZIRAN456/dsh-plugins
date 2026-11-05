@@ -9,32 +9,60 @@ export function apply(ctx) {
       methods: ['POST'],
       fetch: async () => {
         if (process.platform !== 'win32') {
-          return new Response(JSON.stringify({ ok: false, error: 'Only Windows is supported' }), {
-            status: 400,
+          return new Response(JSON.stringify({ ok: false, error: 'unsupported-platform' }), {
+            status: 501,
             headers: { 'Content-Type': 'application/json' },
           });
         }
 
-        try {
-          const child = spawn('explorer.exe', ['ms-screenclip:'], {
-            detached: true,
-            stdio: 'ignore',
-          });
+        return new Promise((resolve) => {
+          let settled = false;
+          let child;
+          try {
+            child = spawn('explorer.exe', ['ms-screenclip:'], {
+              detached: true,
+              stdio: 'ignore',
+            });
+          } catch (err) {
+            return resolve(new Response(JSON.stringify({ ok: false, error: String(err) }), {
+              status: 500,
+              headers: { 'Content-Type': 'application/json' },
+            }));
+          }
+
           child.on('error', (err) => {
             console.error('[screenshot-button] spawn error:', err);
+            if (!settled) {
+              settled = true;
+              resolve(new Response(JSON.stringify({ ok: false, error: String(err) }), {
+                status: 500,
+                headers: { 'Content-Type': 'application/json' },
+              }));
+            }
           });
-          child.unref();
 
-          return new Response(JSON.stringify({ ok: true }), {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' },
+          child.on('spawn', () => {
+            if (!settled) {
+              settled = true;
+              child.unref();
+              resolve(new Response(JSON.stringify({ ok: true }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              }));
+            }
           });
-        } catch (err) {
-          return new Response(JSON.stringify({ ok: false, error: String(err) }), {
-            status: 500,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
+
+          setTimeout(() => {
+            if (!settled) {
+              settled = true;
+              child.unref();
+              resolve(new Response(JSON.stringify({ ok: true }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              }));
+            }
+          }, 150);
+        });
       },
     });
   }, 'screenshot-button: trigger route');

@@ -213,6 +213,27 @@ async function detachFromWorkspaces(ctx, sessionId) {
 }
 
 /**
+ * Preflight verification: ensure storage structure matches supported DSH layout.
+ */
+async function assertStorageLayout() {
+  const home = dshHome();
+  const sessionsDir = join(home, 'sessions');
+  try {
+    const s = await stat(sessionsDir);
+    if (!s.isDirectory()) {
+      throw new DeleteFailure(500, 'session-admin/storage-incompatible', `Expected directory at ${sessionsDir}`);
+    }
+  } catch (err) {
+    if (err instanceof DeleteFailure) throw err;
+    try {
+      await stat(home);
+    } catch {
+      throw new DeleteFailure(500, 'session-admin/storage-incompatible', `DSH home directory not found: ${home}`);
+    }
+  }
+}
+
+/**
  * Permanently delete one Session.
  *
  * A Session whose Agent is resident in this process still holds its log in
@@ -228,6 +249,7 @@ async function detachFromWorkspaces(ctx, sessionId) {
  * @throws {DeleteFailure} for a missing id or a running Agent.
  */
 async function deleteSession(ctx, sessionId) {
+  await assertStorageLayout();
   if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
     throw new DeleteFailure(400, 'session-admin/invalid-id', 'sessionId must be a non-empty string');
   }

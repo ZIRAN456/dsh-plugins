@@ -82,8 +82,22 @@ window.__ModuleLoader__.load({
       const [status, setStatus] = React.useState('idle'); // 'idle' | 'capturing' | 'success'
       const [hoverScreenshot, setHoverScreenshot] = React.useState(false);
       const [hoverPaste, setHoverPaste] = React.useState(false);
+      const activeCycleRef = React.useRef(null);
+      const isUnmountedRef = React.useRef(false);
+      const lastInsertedFingerprintRef = React.useRef(null);
       const isZh = typeof navigator !== 'undefined' && (navigator.language || '').toLowerCase().startsWith('zh');
       const isWin = typeof navigator !== 'undefined' && /windows|win32/i.test(navigator.userAgent || navigator.platform || '');
+
+      React.useEffect(() => {
+        isUnmountedRef.current = false;
+        return () => {
+          isUnmountedRef.current = true;
+          if (activeCycleRef.current) {
+            activeCycleRef.current.abort();
+            activeCycleRef.current = null;
+          }
+        };
+      }, []);
 
       const handlePasteDirect = async () => {
         setStatus('capturing');
@@ -99,11 +113,19 @@ window.__ModuleLoader__.load({
       };
 
       const handleScreenshot = async () => {
+        // Cancel any active capture cycle before starting a new one
+        if (activeCycleRef.current) {
+          activeCycleRef.current.abort();
+          activeCycleRef.current = null;
+        }
+
         setStatus('capturing');
 
         // 1. Calculate baseline image fingerprint (bytes + SHA-256) before snipping
         const baselineBlob = await readImageBlobFromClipboard();
         const baselineFingerprint = await computeBlobFingerprint(baselineBlob);
+
+        if (isUnmountedRef.current) return;
 
         // 2. Trigger Windows native screen snipping via Host endpoint
         try {
@@ -113,14 +135,16 @@ window.__ModuleLoader__.load({
           });
           if (!resp.ok) {
             console.warn('[ScreenshotButton] trigger snipping rejected with status:', resp.status);
-            setStatus('idle');
+            if (!isUnmountedRef.current) setStatus('idle');
             return;
           }
         } catch (err) {
           console.warn('[ScreenshotButton] trigger snipping error:', err);
-          setStatus('idle');
+          if (!isUnmountedRef.current) setStatus('idle');
           return;
         }
+
+        if (isUnmountedRef.current) return;
 
         // 3. Continuously poll every 500ms and check immediately on window focus, up to 12s
         let handled = false;
@@ -132,22 +156,41 @@ window.__ModuleLoader__.load({
           if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
           if (expireTimer) { clearTimeout(expireTimer); expireTimer = null; }
           window.removeEventListener('focus', onFocus);
+          if (activeCycleRef.current === cycle) {
+            activeCycleRef.current = null;
+          }
         };
 
+        const cycle = {
+          abort: () => {
+            handled = true;
+            cleanup();
+          },
+        };
+        activeCycleRef.current = cycle;
+
         const checkClipboard = async () => {
-          if (handled || inFlight) return;
+          if (handled || inFlight || isUnmountedRef.current) return;
           inFlight = true;
           try {
             const currentBlob = await readImageBlobFromClipboard();
-            if (!currentBlob || handled) return;
+            if (!currentBlob || handled || isUnmountedRef.current) return;
             const currentFingerprint = await computeBlobFingerprint(currentBlob);
-            if (currentFingerprint && currentFingerprint !== baselineFingerprint && !handled) {
+            if (currentFingerprint && currentFingerprint !== baselineFingerprint && !handled && !isUnmountedRef.current) {
+              if (lastInsertedFingerprintRef.current === currentFingerprint) {
+                return;
+              }
               handled = true;
+              lastInsertedFingerprintRef.current = currentFingerprint;
               cleanup();
               const file = new File([currentBlob], `screenshot-${Date.now()}.png`, { type: currentBlob.type || 'image/png' });
               insertImageFile(file);
-              setStatus('success');
-              setTimeout(() => setStatus('idle'), 1600);
+              if (!isUnmountedRef.current) {
+                setStatus('success');
+                setTimeout(() => {
+                  if (!isUnmountedRef.current) setStatus('idle');
+                }, 1600);
+              }
             }
           } finally {
             inFlight = false;
@@ -166,7 +209,7 @@ window.__ModuleLoader__.load({
         expireTimer = setTimeout(() => {
           if (!handled) {
             cleanup();
-            setStatus('idle');
+            if (!isUnmountedRef.current) setStatus('idle');
           }
         }, 12000);
       };
@@ -257,7 +300,12 @@ window.__ModuleLoader__.load({
           h('button', {
             key: 'main-btn',
             type: 'button',
-            style: screenshotBtnStyle,
+            disabled: status === 'capturing',
+            style: {
+              ...screenshotBtnStyle,
+              cursor: status === 'capturing' ? 'default' : 'pointer',
+              opacity: status === 'capturing' ? 0.85 : 1,
+            },
             title: isZh ? '唤起系统截图 (Win+Shift+S)，框选后切回自动插入' : 'Trigger Windows Snip (Win+Shift+S) and auto-insert',
             onClick: handleScreenshot,
             onMouseEnter: () => setHoverScreenshot(true),
